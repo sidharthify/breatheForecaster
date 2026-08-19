@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
  # breatheForecaster
- # Copyright (c) 2026 The Breathe Open Source Project
+ # Copyright (c) 2026 Sidharth (Siddhi) Sharma <wednisegit@gmail.com>
  #
  # Permission is hereby granted, free of charge, to any person obtaining a copy
  # of this software and associated documentation files (the "Software"), to deal
@@ -38,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 # COLORS AND CONSTANTS
 # ------------------------------------------------------------
 
-# Colours are switched off when the output is not a terminal, so that piping
+# Colors are switched off when the output is not a terminal, so that piping
 # the output into a file or another program does not fill it with escape codes.
 if sys.stdout.isatty():
     BLUE = "\033[34m"
@@ -69,8 +69,7 @@ API_BASE = os.environ.get("BREATHE_API", "https://api.breatheoss.app")
 # try to predict the weather ourselves.
 WEATHER_API = "https://api.open-meteo.com/v1/forecast"
 
-# India Standard Time. A "day" in this tool always means an IST calendar day,
-# because that is the day a person in Jammu or Srinagar actually lives through.
+# India Standard Time.
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # How many hourly readings a day needs before we trust it. A day built out of
