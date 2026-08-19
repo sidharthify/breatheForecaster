@@ -1,4 +1,9 @@
 # breatheForecaster
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="Screenshot 1" width="900" style="border-radius:26px;"/>
+</p>
+
 A dependency free command line forecaster for the **BreatheOSS** network. It reads the zone history served by the Breathe API, fits a small statistical model to it, and prints seven days of PM2.5, PM10 and AQI alongside the weather that drives them. It also keeps a journal of what it predicted, so that the forecasts can be graded once the days have actually happened.
 
 The whole tool is one file and uses nothing outside the Python standard library.
