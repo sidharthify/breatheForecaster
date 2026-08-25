@@ -106,35 +106,50 @@ PHI_MAXIMUM = 0.95
 # If you wanted a 95% range instead you would use 1.96.
 INTERVAL_MULTIPLIER = 1.2816
 
-# Indian CPCB breakpoints, copied from the Breathe API's aqi_breakpoints.json so
-# that this tool and the API always agree. Each row is:
+# US EPA breakpoints, copied from the Breathe API's US_BREAKPOINTS table in
+# conversions.py so that this tool and the API always agree. Each row is:
 #   [concentration low, concentration high, index low, index high]
-CPCB_PM2_5 = [
-    [0, 30, 0, 50],
-    [31, 60, 51, 100],
-    [61, 90, 101, 200],
-    [91, 120, 201, 300],
-    [121, 250, 301, 400],
-    [251, 5000, 401, 500],
+# The PM2.5 rows are the 2024 revision, in which Good ends at 9.0 rather than
+# at the older 12.0.
+EPA_PM2_5 = [
+    [0.0, 9.0, 0, 50],
+    [9.1, 35.4, 51, 100],
+    [35.5, 55.4, 101, 150],
+    [55.5, 125.4, 151, 200],
+    [125.5, 225.4, 201, 300],
+    [225.5, 325.4, 301, 400],
+    [325.5, 500.4, 401, 500],
 ]
 
-CPCB_PM10 = [
-    [0, 50, 0, 50],
-    [51, 100, 51, 100],
-    [101, 250, 101, 200],
-    [251, 350, 201, 300],
-    [351, 430, 301, 400],
-    [431, 5000, 401, 500],
+EPA_PM10 = [
+    [0, 54, 0, 50],
+    [55, 154, 51, 100],
+    [155, 254, 101, 150],
+    [255, 354, 151, 200],
+    [355, 424, 201, 300],
+    [425, 504, 301, 400],
+    [505, 604, 401, 500],
 ]
 
-# The names CPCB gives to each band of the index.
+# The precision each table is written to. The EPA truncates a reading to this
+# many decimals before looking it up, and that step is not cosmetic: the PM2.5
+# rows run [0.0, 9.0] then [9.1, 35.4], so a reading of 9.05 sits in the gap
+# between two rows and belongs to neither until it has been truncated.
+EPA_DECIMALS = {
+    "pm2_5": 1,
+    "pm10": 0,
+}
+
+# The names the EPA gives each band, and a short form for the terminal table.
+# The long names are the exact strings the Breathe site uses in getAQICategory,
+# so a category here and a category there are the same string.
 AQI_CATEGORIES = [
-    [0, 50, "Good"],
-    [51, 100, "Satisfactory"],
-    [101, 200, "Moderate"],
-    [201, 300, "Poor"],
-    [301, 400, "Very Poor"],
-    [401, 10000, "Severe"],
+    [0, 50, "Good", "Good"],
+    [51, 100, "Moderate", "Moderate"],
+    [101, 150, "Unhealthy for Sensitive Groups", "Sensitive"],
+    [151, 200, "Unhealthy", "Unhealthy"],
+    [201, 300, "Very Unhealthy", "Very Unhealthy"],
+    [301, 10000, "Hazardous", "Hazardous"],
 ]
 
 # Respects XDG_DATA_HOME if it is set, otherwise falls back to ~/.local/share.
@@ -414,7 +429,17 @@ def daily_averages(readings: list, column: str) -> dict:
     Days with fewer than MIN_HOURS_IN_A_DAY readings are left out entirely
     rather than being filled in with a guess. A missing day is honest; an
     invented one quietly poisons everything downstream.
+
+    The day that is still in progress is dropped too, however many readings it
+    has so far. The 12 hour rule is the right test for a day with a gap in the
+    middle of it and the wrong test for today: at six in the evening today has
+    18 readings and passes, but its dirtiest hours have not happened yet.
+    Measured over the last 30 complete Jammu days, a midnight to five o'clock
+    mean runs about 5% below the full day, so an unfinished day both anchors a
+    forecast too low and grades yesterday's forecast against a number that is
+    still moving.
     '''
+    today = datetime.now(IST).date()
     hours_by_day = {}
     for reading in readings:
         if column not in reading:
@@ -426,6 +451,8 @@ def daily_averages(readings: list, column: str) -> dict:
 
     averages = {}
     for day in hours_by_day:
+        if day >= today:
+            continue
         hours = hours_by_day[day]
         if len(hours) < MIN_HOURS_IN_A_DAY:
             continue
@@ -478,9 +505,9 @@ def to_logs(days: list) -> list:
 # THE AQI TABLES
 # ------------------------------------------------------------
 
-def sub_index(concentration: float, table: list) -> int:
+def sub_index(concentration: float, table: list, decimals: int) -> int:
     '''
-    Converts a concentration into its AQI sub-index using the CPCB tables.
+    Converts a concentration into its AQI sub-index using the EPA tables.
 
     Inside a band the relationship is a straight line, so we work out how far
     along the concentration band we are, and move the same fraction along the
@@ -488,10 +515,23 @@ def sub_index(concentration: float, table: list) -> int:
 
         index = index_low + (index_high - index_low) * how_far_along
 
-    Anything above the top of the table is capped at 500.
+    The truncation on the way in is load-bearing. The bands do not touch: PM2.5
+    runs [0.0, 9.0] and then [9.1, 35.4], so a daily mean of 9.05 matches no
+    band at all. Rounding it down to the precision the table is written in, as
+    the EPA instructs, puts every possible reading inside exactly one band.
+    Without it a perfectly clean day falls through every row and comes out of
+    the bottom of this function as 500.
+
+    Anything genuinely above the top of the table is capped at 500.
     '''
     if concentration is None:
         return None
+
+    scale = math.pow(10, decimals)
+    concentration = math.floor(concentration * scale) / scale
+
+    if concentration < table[0][0]:
+        return 0
 
     for band in table:
         concentration_low = band[0]
@@ -509,15 +549,15 @@ def sub_index(concentration: float, table: list) -> int:
 
     return 500
 
-def indian_aqi(pm2_5: float, pm10: float) -> list:
+def epa_aqi(pm2_5: float, pm10: float) -> list:
     '''
-    Returns [aqi, main_pollutant] the way CPCB defines it.
+    Returns [aqi, main_pollutant] the way the US EPA defines it.
 
     The AQI is NOT an average of the pollutants. It is the worst of them, and
     whichever pollutant produced that worst number is the "main pollutant".
     '''
-    pm2_5_index = sub_index(pm2_5, CPCB_PM2_5)
-    pm10_index = sub_index(pm10, CPCB_PM10)
+    pm2_5_index = sub_index(pm2_5, EPA_PM2_5, EPA_DECIMALS["pm2_5"])
+    pm10_index = sub_index(pm10, EPA_PM10, EPA_DECIMALS["pm10"])
 
     if pm2_5_index is None and pm10_index is None:
         return [None, None]
@@ -532,14 +572,29 @@ def indian_aqi(pm2_5: float, pm10: float) -> list:
 
 def aqi_category(aqi: int) -> str:
     '''
-    The CPCB name for a given AQI value, for example "Moderate".
+    The EPA name for a given AQI value, for example "Unhealthy".
     '''
     if aqi is None:
         return "unknown"
     for band in AQI_CATEGORIES:
         if aqi >= band[0] and aqi <= band[1]:
             return band[2]
-    return "Severe"
+    return "Hazardous"
+
+def aqi_category_short(aqi: int) -> str:
+    '''
+    The same band, abbreviated to fit a terminal column.
+
+    Display only. Everything that compares two categories, or writes one to the
+    journal, uses the full name from aqi_category so that the strings stay
+    comparable with the ones the site and the apps use.
+    '''
+    if aqi is None:
+        return "unknown"
+    for band in AQI_CATEGORIES:
+        if aqi >= band[0] and aqi <= band[1]:
+            return band[3]
+    return "Hazardous"
 
 def colour_for_aqi(aqi: int) -> str:
     '''
@@ -548,9 +603,9 @@ def colour_for_aqi(aqi: int) -> str:
     '''
     if aqi is None:
         return GREY
-    if aqi <= 100:
+    if aqi <= 50:
         return GREEN
-    if aqi <= 200:
+    if aqi <= 100:
         return YELLOW
     return RED
 
@@ -832,10 +887,17 @@ def write_journal(zone_id: str, issued_on: date, rows: list) -> Path:
     early even if the model is bad.
     '''
     path = journal_path(zone_id)
+    origin_day = rows[0]["day"] - timedelta(days=rows[0]["steps_ahead"])
     entry = {
         "zone_id": zone_id,
         "issued_on": issued_on.isoformat(),
         "issued_at": datetime.now(IST).isoformat(),
+        # Which day's reading the forecast was anchored on. This is the last
+        # complete day, so on a run just after midnight it is yesterday.
+        "origin_day": origin_day.isoformat(),
+        # Which AQI scale the category names below belong to. Entries written
+        # before the move to EPA have no scale field and carry CPCB names.
+        "scale": "epa",
         "days": [],
     }
     for row in rows:
@@ -947,7 +1009,7 @@ def build_forecast(zone_id: str, horizon: int) -> list:
         else:
             pm10_rounded = round(pm10_value, 1)
 
-        aqi_result = indian_aqi(pm2_5_value, pm10_value)
+        aqi_result = epa_aqi(pm2_5_value, pm10_value)
 
         rows.append({
             "day": last_day + timedelta(days=steps_ahead),
@@ -1013,7 +1075,7 @@ def command_forecast(zone_id: str, horizon: int, as_json: bool):
             span,
             pm10_label,
             colour, row["aqi"], RESET,
-            colour, row["category"], RESET,
+            colour, aqi_category_short(row["aqi"]), RESET,
             weather_label,
         ))
 
@@ -1099,129 +1161,181 @@ def command_record(zone_id: str, horizon: int):
     have actually happened.
     '''
     find_zone(zone_id)
-    rows = build_forecast(zone_id, horizon)
     today = datetime.now(IST).date()
+
+    # A workflow that reruns after a failure should not leave two forecasts for
+    # the same night in the journal, which would count that night twice in every
+    # average the scorecard reports.
+    for entry in read_journal(zone_id):
+        if entry["issued_on"] == today.isoformat():
+            print(f"{WARN} {zone_id} already has a forecast recorded for {today}")
+            print(f"{INFO} the journal keeps one entry per day, nothing written")
+            return
+
+    rows = build_forecast(zone_id, horizon)
     path = write_journal(zone_id, today, rows)
 
     print(f"{SUCCESS} recorded {len(rows)} days for {zone_id}")
     print(f"{INFO} {path}")
 
+def grade_journal(zone_id: str) -> dict:
+    '''
+    Lines every recorded forecast up against what actually happened.
+
+    This is the one measurement in the tool that cannot be rebuilt from history.
+    Everything `backtest` reports could be recomputed from scratch tomorrow; a
+    record of what we said before we knew the answer only accumulates at one day
+    per day.
+
+    Returns the scored day-pairs and the same pairs grouped by lead time, so
+    that `score` can print a table and `report` can print markdown without
+    either of them owning the arithmetic.
+    '''
+    entries = read_journal(zone_id)
+    readings = fetch_history(zone_id, "1y")
+    actual_pm2_5 = daily_averages(readings, "pm2_5")
+    actual_pm10 = daily_averages(readings, "pm10")
+
+    scored = []
+    for entry in entries:
+        for day_entry in entry["days"]:
+            day = date.fromisoformat(day_entry["day"])
+            if day not in actual_pm2_5:
+                continue
+
+            truth = actual_pm2_5[day]
+            truth_pm10 = actual_pm10.get(day)
+            predicted = day_entry["pm2_5"]
+
+            # The index is recomputed from the concentrations we recorded rather
+            # than read back from the journal. Concentrations are what the model
+            # actually forecasts; the index is a lookup on top of them. That
+            # means a forecast recorded under the old CPCB tables can still be
+            # graded on today's EPA scale, and that changing the scale again
+            # later will never silently strand the history.
+            predicted_aqi = epa_aqi(predicted, day_entry["pm10"])[0]
+            predicted_category = aqi_category(predicted_aqi)
+
+            # The truth category is built from both pollutants because the
+            # predicted category was. Grading a PM2.5-and-PM10 forecast against
+            # a PM2.5-only truth marks the exam against the wrong answer key.
+            truth_aqi = epa_aqi(truth, truth_pm10)[0]
+            truth_category = aqi_category(truth_aqi)
+
+            scored.append({
+                "issued_on": entry["issued_on"],
+                "day": day,
+                "lead": day_entry["steps_ahead"],
+                "predicted": predicted,
+                "predicted_low": day_entry["pm2_5_low"],
+                "predicted_high": day_entry["pm2_5_high"],
+                "predicted_aqi": predicted_aqi,
+                "predicted_category": predicted_category,
+                "truth": round(truth, 1),
+                "truth_pm10": None if truth_pm10 is None else round(truth_pm10, 1),
+                "truth_aqi": truth_aqi,
+                "truth_category": truth_category,
+                "error": (predicted - truth) / truth,
+                "inside": day_entry["pm2_5_low"] <= truth <= day_entry["pm2_5_high"],
+            })
+
+    by_lead = {}
+    for row in scored:
+        if row["lead"] not in by_lead:
+            by_lead[row["lead"]] = []
+        by_lead[row["lead"]].append(row)
+
+    return {
+        "entries": entries,
+        "scored": scored,
+        "by_lead": by_lead,
+        "actual_pm2_5": actual_pm2_5,
+        "actual_pm10": actual_pm10,
+    }
+
+def summarise_lead(rows: list) -> dict:
+    '''
+    Boils one lead time's scored days down to the handful of numbers worth
+    printing: how far off we typically were, how often the published range
+    contained the truth, and how often the category was right.
+    '''
+    absolute_errors = []
+    for row in rows:
+        absolute_errors.append(abs(row["error"]))
+
+    inside = []
+    for row in rows:
+        if row["inside"]:
+            inside.append(1)
+        else:
+            inside.append(0)
+
+    exact = []
+    close = []
+    for row in rows:
+        if row["predicted_category"] == row["truth_category"]:
+            exact.append(1)
+        else:
+            exact.append(0)
+        gap = abs(category_position(row["predicted_category"]) - category_position(row["truth_category"]))
+        if gap <= 1:
+            close.append(1)
+        else:
+            close.append(0)
+
+    return {
+        "days": len(rows),
+        "typical": percentile(absolute_errors, 0.5),
+        "mean": average(absolute_errors),
+        "bias": average([row["error"] for row in rows]),
+        "coverage": average(inside),
+        "exact": average(exact),
+        "close": average(close),
+    }
+
 def command_score(zone_id: str):
     '''
     Grades every recorded forecast whose day has now passed.
 
-    This is the loop that makes the tool improve rather than just run. A
-    backtest tells you how the model would have done; this tells you how it
+    A backtest tells you how the model would have done. This tells you how it
     actually did, on forecasts made before anyone knew the answer.
     '''
     find_zone(zone_id)
-    entries = read_journal(zone_id)
-    if len(entries) == 0:
+    graded = grade_journal(zone_id)
+
+    if len(graded["entries"]) == 0:
         print(f"{WARN} nothing recorded yet for {zone_id}")
         print(f"{INFO} run: forecaster record {zone_id}")
         return
-
-    readings = fetch_history(zone_id, "1y")
-    actual = daily_averages(readings, "pm2_5")
-
-    errors_by_lead = {}
-    exact_by_lead = {}
-    close_by_lead = {}
-    scored_rows = []
-
-    for entry in entries:
-        for day_entry in entry["days"]:
-            day = date.fromisoformat(day_entry["day"])
-            if day not in actual:
-                continue
-
-            truth = actual[day]
-            predicted = day_entry["pm2_5"]
-            lead = day_entry["steps_ahead"]
-
-            relative_error = (predicted - truth) / truth
-
-            if lead not in errors_by_lead:
-                errors_by_lead[lead] = []
-                exact_by_lead[lead] = []
-                close_by_lead[lead] = []
-            errors_by_lead[lead].append(relative_error)
-
-            truth_aqi = indian_aqi(truth, None)
-            truth_category = aqi_category(truth_aqi[0])
-            predicted_category = day_entry["category"]
-
-            if predicted_category == truth_category:
-                exact_by_lead[lead].append(1)
-            else:
-                exact_by_lead[lead].append(0)
-
-            truth_position = category_position(truth_category)
-            predicted_position = category_position(predicted_category)
-            if abs(truth_position - predicted_position) <= 1:
-                close_by_lead[lead].append(1)
-            else:
-                close_by_lead[lead].append(0)
-
-            # Did the truth land inside the range we published? Over many days
-            # this should happen about 80% of the time. Much less and we are
-            # overconfident, much more and the ranges are uselessly wide.
-            if truth >= day_entry["pm2_5_low"] and truth <= day_entry["pm2_5_high"]:
-                inside_range = True
-            else:
-                inside_range = False
-
-            scored_rows.append({
-                "day": day,
-                "lead": lead,
-                "predicted": predicted,
-                "truth": round(truth, 1),
-                "error": relative_error,
-                "inside": inside_range,
-            })
-
-    if len(scored_rows) == 0:
-        print(f"{WARN} {len(entries)} forecasts recorded, none have come due yet")
+    if len(graded["scored"]) == 0:
+        print(f"{WARN} {len(graded['entries'])} forecasts recorded, none have come due yet")
         return
 
     print()
     print(f"{BOLD}Scorecard: {zone_id}{RESET}")
     print()
-    print(f"  forecasts recorded  {len(entries)}")
-    print(f"  days scored         {len(scored_rows)}")
+    print(f"  forecasts recorded  {len(graded['entries'])}")
+    print(f"  days scored         {len(graded['scored'])}")
     print()
     print("  {:<8}{:>8}{:>12}{:>14}{:>12}".format("LEAD", "DAYS", "TYPICAL", "RIGHT BAND", "WITHIN 1"))
     print(f"  {GREY}{'-' * 54}{RESET}")
 
-    for lead in sorted(errors_by_lead):
-        errors = errors_by_lead[lead]
-        absolute_errors = []
-        for error in errors:
-            absolute_errors.append(abs(error))
-
-        typical = percentile(absolute_errors, 0.5)
-        exact_rate = average(exact_by_lead[lead])
-        close_rate = average(close_by_lead[lead])
-
+    for lead in sorted(graded["by_lead"]):
+        summary = summarise_lead(graded["by_lead"][lead])
         print("  {:<8}{:>8}{:>12}{:>14}{:>12}".format(
             f"d+{lead}",
-            len(errors),
-            "{:.0f}%".format(typical * 100),
-            "{:.0f}%".format(exact_rate * 100),
-            "{:.0f}%".format(close_rate * 100),
+            summary["days"],
+            "{:.0f}%".format(summary["typical"] * 100),
+            "{:.0f}%".format(summary["exact"] * 100),
+            "{:.0f}%".format(summary["close"] * 100),
         ))
 
-    inside_count = 0
-    for row in scored_rows:
-        if row["inside"]:
-            inside_count = inside_count + 1
-    coverage = inside_count / len(scored_rows)
-
+    overall = summarise_lead(graded["scored"])
     print()
-    print("  80% ranges actually contained the truth {:.0f}% of the time".format(coverage * 100))
-    if coverage < 0.65:
+    print("  80% ranges actually contained the truth {:.0f}% of the time".format(overall["coverage"] * 100))
+    if overall["coverage"] < 0.65:
         print(f"  {WARN} that is well under 80%, the ranges are too narrow")
-    if coverage > 0.95:
+    if overall["coverage"] > 0.95:
         print(f"  {WARN} that is well over 80%, the ranges are wider than they need to be")
 
     print()
@@ -1232,7 +1346,7 @@ def command_score(zone_id: str):
     def sort_key(row):
         return (row["day"], row["lead"])
 
-    recent = sorted(scored_rows, key=sort_key)
+    recent = sorted(graded["scored"], key=sort_key)
     recent = recent[-10:]
     for row in recent:
         if abs(row["error"]) <= 0.25:
@@ -1251,6 +1365,209 @@ def command_score(zone_id: str):
             RESET,
         ))
     print()
+
+
+def markdown_report(zone_id: str, horizon: int) -> str:
+    '''
+    Builds the whole public log as markdown: what we are forecasting now, how
+    every past forecast turned out, and the running scorecard over all of them.
+
+    Written as one string rather than printed, so that a workflow can put it
+    straight into a README and a person can read it on a terminal first.
+    '''
+    zone = find_zone(zone_id)
+    rows = build_forecast(zone_id, horizon)
+    weather = fetch_weather(zone["lat"], zone["lon"], horizon)
+    graded = grade_journal(zone_id)
+
+    now = datetime.now(IST)
+    origin_day = rows[0]["day"] - timedelta(days=rows[0]["steps_ahead"])
+
+    out = []
+    out.append(f"# {zone['name']} air quality forecast log")
+    out.append("")
+    out.append("Seven day PM2.5 and PM10 forecasts for "
+               f"{zone['name']}, published before the days happen and graded "
+               "afterwards. A workflow regenerates this file every night. "
+               "Nothing in it is written by hand, and no forecast is ever "
+               "edited once recorded.")
+    out.append("")
+    out.append("> **This is an experiment.** It is not wired into the Breathe "
+               "site or the apps, and nobody should plan around it yet. It is "
+               "here so that the model can be watched in public for a while "
+               "before anyone decides whether it is worth shipping.")
+    out.append("")
+    out.append(f"Last run **{now.strftime('%Y-%m-%d %H:%M')} IST**. "
+               f"Zone `{zone_id}`. Index is the **US EPA AQI**. "
+               "Model and method: "
+               "[breatheForecaster](https://github.com/sidharthify/breatheForecaster).")
+    out.append("")
+
+    # ---- what we are saying now
+    out.append("## Next seven days")
+    out.append("")
+    out.append(f"Anchored on {origin_day.isoformat()}, the last day of sensor "
+               "data that is actually finished.")
+    out.append("")
+    out.append("| Day | Lead | PM2.5 | 80% range | PM10 | AQI | Category | Weather |")
+    out.append("|---|---|---:|---|---:|---:|---|---|")
+    for row in rows:
+        if row["pm10"] is None:
+            pm10_label = "n/a"
+        else:
+            pm10_label = f"{row['pm10']:.1f}"
+
+        weather_label = ""
+        if row["day"] in weather:
+            forecast = weather[row["day"]]
+            weather_label = "{}, {:.0f} to {:.0f}C".format(
+                describe_weather(forecast["code"]),
+                forecast["temp_min"],
+                forecast["temp_max"],
+            )
+            if forecast["rain"] is not None and forecast["rain"] >= 1.0:
+                weather_label = weather_label + ", {:.0f}mm".format(forecast["rain"])
+
+        out.append("| {} | d+{} | {:.1f} | {:.1f} to {:.1f} | {} | {} | {} | {} |".format(
+            row["day"].strftime("%a %d %b"),
+            row["steps_ahead"],
+            row["pm2_5"],
+            row["pm2_5_low"],
+            row["pm2_5_high"],
+            pm10_label,
+            row["aqi"],
+            row["category"],
+            weather_label,
+        ))
+    out.append("")
+    out.append("Concentrations are daily means in micrograms per cubic metre. "
+               "The range is an 80% interval measured from this zone's own past "
+               "errors, not from theory. Past about day three the forecast is "
+               "essentially the 14 day seasonal level, which is the model being "
+               "honest rather than the model giving up.")
+    out.append("")
+
+    # ---- how we have done
+    out.append("## Running scorecard")
+    out.append("")
+    if len(graded["scored"]) == 0:
+        out.append("No recorded forecast has come due yet. This table fills in "
+                   "from tomorrow.")
+        out.append("")
+    else:
+        out.append("Every forecast this log has published, graded once its day "
+                   "finished. Nothing here is a backtest.")
+        out.append("")
+        out.append("| Lead | Days scored | Typical miss | Mean miss | Bias | Inside 80% range | Category exact | Within one band |")
+        out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for lead in sorted(graded["by_lead"]):
+            summary = summarise_lead(graded["by_lead"][lead])
+            out.append("| d+{} | {} | {:.0f}% | {:.0f}% | {:+.0f}% | {:.0f}% | {:.0f}% | {:.0f}% |".format(
+                lead,
+                summary["days"],
+                summary["typical"] * 100,
+                summary["mean"] * 100,
+                summary["bias"] * 100,
+                summary["coverage"] * 100,
+                summary["exact"] * 100,
+                summary["close"] * 100,
+            ))
+        out.append("")
+        overall = summarise_lead(graded["scored"])
+        out.append("Across all lead times the 80% range contained the truth "
+                   "**{:.0f}%** of the time on **{}** scored days. A range that "
+                   "says 80% should land near 80%: much less and it is "
+                   "overconfident, much more and it is wider than it needs to "
+                   "be. Bias is the direction of the miss, so a positive number "
+                   "means the forecast ran high.".format(
+                       overall["coverage"] * 100, overall["days"]))
+        out.append("")
+
+    # ---- the log itself
+    out.append("## Forecast log")
+    out.append("")
+    out.append("One block per night. Actual values appear as each day finishes, "
+               "so the newest block is empty and the oldest is complete.")
+    out.append("")
+
+    scored_by_day = {}
+    for row in graded["scored"]:
+        scored_by_day[(row["issued_on"], row["day"])] = row
+
+    entries = sorted(graded["entries"], key=lambda e: e["issued_on"], reverse=True)
+    for entry in entries[:10]:
+        out.append(f"### Issued {entry['issued_on']}")
+        out.append("")
+        if entry.get("scale") != "epa":
+            out.append("_Recorded before this log moved to the EPA index. The "
+                       "concentrations are exactly as they were published; the "
+                       "index column is recomputed from them on the EPA scale so "
+                       "that it can be compared with the rest._")
+            out.append("")
+        out.append("| Day | Lead | Forecast PM2.5 | 80% range | Forecast AQI | Actual PM2.5 | Actual AQI | Miss | In range |")
+        out.append("|---|---|---:|---|---:|---:|---:|---:|---|")
+        for day_entry in entry["days"]:
+            day = date.fromisoformat(day_entry["day"])
+            scored = scored_by_day.get((entry["issued_on"], day))
+            if scored is None:
+                actual_label = "pending"
+                actual_aqi_label = "pending"
+                miss_label = "n/a"
+                inside_label = "n/a"
+            else:
+                actual_label = "{:.1f}".format(scored["truth"])
+                actual_aqi_label = str(scored["truth_aqi"])
+                miss_label = "{:+.0f}%".format(scored["error"] * 100)
+                if scored["inside"]:
+                    inside_label = "yes"
+                else:
+                    inside_label = "**no**"
+            out.append("| {} | d+{} | {:.1f} | {:.1f} to {:.1f} | {} | {} | {} | {} | {} |".format(
+                day.strftime("%a %d %b"),
+                day_entry["steps_ahead"],
+                day_entry["pm2_5"],
+                day_entry["pm2_5_low"],
+                day_entry["pm2_5_high"],
+                epa_aqi(day_entry["pm2_5"], day_entry["pm10"])[0],
+                actual_label,
+                actual_aqi_label,
+                miss_label,
+                inside_label,
+            ))
+        out.append("")
+
+    if len(entries) > 10:
+        out.append(f"_{len(entries) - 10} older forecasts are not shown. The "
+                   "full journal is in `journal/` and nothing is ever removed "
+                   "from it._")
+        out.append("")
+
+    # ---- the caveats, which belong next to the numbers and not in a footnote
+    out.append("## What these numbers do and do not show")
+    out.append("")
+    out.append("**A miss is a percentage, not micrograms.** A 20% miss on a "
+               "clean day and a 20% miss on a filthy one are the same size of "
+               "mistake to this model, which is why it works in logs.")
+    out.append("")
+    out.append("**Category accuracy flatters itself.** Most days in one place "
+               "fall in the same EPA band, so a program that printed the most "
+               "common band every day would already score well. Read the "
+               "category columns against that, not against zero.")
+    out.append("")
+    out.append("**The record is short and starts in January 2026.** No autumn "
+               "or winter has been observed here at all. Everything this model "
+               "does in November is extrapolation until it has been through "
+               "one, and absolute errors in winter will be larger because "
+               "winter levels are several times higher.")
+    out.append("")
+
+    return "\n".join(out)
+
+def command_report(zone_id: str, horizon: int):
+    '''
+    Prints the markdown log to stdout, for a workflow to redirect into a README.
+    '''
+    print(markdown_report(zone_id, horizon))
 
 def category_position(name: str) -> int:
     '''
@@ -1301,6 +1618,7 @@ def help():
     print("  forecaster backtest <zone> [--days N]")
     print("  forecaster record   <zone> [--days N]")
     print("  forecaster score    <zone>")
+    print("  forecaster report   <zone> [--days N]")
     print("  forecaster zones")
     print("  forecaster --help\n")
 
@@ -1309,6 +1627,7 @@ def help():
     print("  backtest      Measure the model against the baselines it has to beat")
     print("  record        Save today's forecast so it can be scored later")
     print("  score         Grade the recorded forecasts whose days have passed")
+    print("  report        Print the forecast and the scorecard as markdown")
     print("  zones         List the zones the API knows about")
     print("  --help        Show this help message and exit\n")
 
@@ -1320,7 +1639,8 @@ def help():
     print("  forecaster forecast jammu_city")
     print("  forecaster forecast srinagar --days 3")
     print("  forecaster backtest jammu_city")
-    print("  forecaster record jammu_city && forecaster score jammu_city\n")
+    print("  forecaster record jammu_city && forecaster score jammu_city")
+    print("  forecaster report jammu_city > README.md\n")
 
     print(f"{INFO} API: {API_BASE}")
     print(f"{INFO} Journal: {DATA_DIR}")
@@ -1409,6 +1729,13 @@ def main():
             print(f"{INFO} Usage: forecaster score <zone>")
             sys.exit(1)
         command_score(args[0])
+
+    # forecaster report
+    elif subcommand == "report":
+        if len(args) != 1:
+            print(f"{INFO} Usage: forecaster report <zone>")
+            sys.exit(1)
+        command_report(args[0], horizon)
 
     # forecaster zones
     elif subcommand == "zones":
